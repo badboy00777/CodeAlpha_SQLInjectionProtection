@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SQL Injection Protection | CodeAlpha Task 2</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+    <header>
+        <h1>SQL Injection Protection</h1>
+        <p>Cloud system with AES-256-GCM, capability tokens and a double-layer defense</p>
+        <div class="layers">
+            <span class="pill">Layer 1: allowlist + capability token + prepared statements</span>
+            <span class="pill">Layer 2: least-privilege DB user + encrypted data</span>
+        </div>
+    </header>
+
+    <main>
+        <section class="card">
+            <h2>1. Account</h2>
+            <label for="reg_user">Username (letters, numbers, _)</label>
+            <input id="reg_user" autocomplete="off">
+            <label for="reg_email">Email (stored AES-256 encrypted)</label>
+            <input id="reg_email" autocomplete="off">
+            <label for="reg_pass">Password (8+ chars, letters and numbers)</label>
+            <input id="reg_pass" type="password" autocomplete="new-password">
+            <button id="btn_register">Register</button>
+            <button id="btn_login" class="secondary">Login with the same details</button>
+            <div class="status" id="session_state">Not logged in</div>
+            <pre id="auth_out">Result will appear here</pre>
+        </section>
+
+        <section class="card">
+            <h2>2. My data (needs a capability token)</h2>
+            <p class="status">Every button below first asks the server for a short-lived token for exactly one scope.
+            </p>
+            <button id="btn_profile" disabled>Load my profile</button>
+            <button id="btn_notes" class="secondary" disabled>Load my notes</button>
+            <label for="note_text">New note (encrypted before saving)</label>
+            <input id="note_text" autocomplete="off">
+            <button id="btn_addnote" disabled>Save note</button>
+            <button id="btn_replay" class="danger" disabled>Replay a used token</button>
+            <div class="status" id="token_info">No token yet</div>
+            <pre id="data_out">Result will appear here</pre>
+            <ul id="notes_list"></ul>
+        </section>
+
+        <section class="card wide">
+            <h2>3. Attack and defense</h2>
+            <p class="status">Pick a classic payload and send it to both versions. The vulnerable page exists only on a
+                local laptop.</p>
+            <button class="secondary" data-preset="0">OR 1=1</button>
+            <button class="secondary" data-preset="1">UNION SELECT</button>
+            <button class="secondary" data-preset="2">Comment --</button>
+            <button class="secondary" data-preset="3">Stacked DROP</button>
+            <label for="payload">Payload</label>
+            <input id="payload" autocomplete="off">
+            <div class="split">
+                <div>
+                    <button id="btn_vuln" class="danger">Send to VULNERABLE search</button>
+                    <div class="status"><span class="tag-bad">Vulnerable:</span> SQL is glued together from your text
+                    </div>
+                    <pre id="vuln_out">Result will appear here</pre>
+                </div>
+                <div>
+                    <button id="btn_secure">Send to SECURE login</button>
+                    <div class="status"><span class="tag-good">Secure:</span> validated, then prepared statements only
+                    </div>
+                    <pre id="secure_out">Result will appear here</pre>
+                </div>
+            </div>
+        </section>
+
+        <section class="card wide">
+            <h2>4. What the server saw (live log)</h2>
+            <pre id="log">Nothing yet</pre>
+        </section>
+    </main>
+
+    <footer>CodeAlpha Cloud Computing Internship | Task 2 | Muhammad Akram</footer>
+
+    <script>
+        const $ = (id) => document.getElementById(id);
+        const PRESETS = [
+            "' OR '1'='1",
+            "x' UNION SELECT id, password_hash, email_enc FROM users -- ",
+            "admin' -- ",
+            "x'; DROP TABLE users; -- "
+        ];
+        let session = null;
+
+        function log(line) {
+            const el = $("log");
+            const first = el.textContent === "Nothing yet" ? "" : el.textContent;
+            el.textContent = new Date().toLocaleTimeString() + "  " + line + "\n" + first;
+        }
+
+        function out(id, data) {
+            $(id).textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+        }
+
+        async function api(path, method, body, token) {
+            const opts = { method: method, headers: { "Content-Type": "application/json" } };
+            if (token) { opts.headers["X-Capability"] = token; }
+            if (body) { opts.body = JSON.stringify(body); }
+            const res = await fetch(path, opts);
+            let data = {};
+            try { data = await res.json(); } catch (e) { data = { error: "No JSON in reply" }; }
+            return { status: res.status, data: data };
+        }
+
+        function setLoggedIn(on) {
+            ["btn_profile", "btn_notes", "btn_addnote", "btn_replay"].forEach((id) => { $(id).disabled = !on; });
+            $("session_state").textContent = on ? "Logged in. Session token is active for 15 minutes." : "Not logged in";
+        }
+
+        async function registerUser() {
+            const r = await api("/api/register", "POST", {
+                username: $("reg_user").value, email: $("reg_email").value, password: $("reg_pass").value
+            });
+            log("POST /api/register -> " + r.status);
+            out("auth_out", r.data);
+        }
+
+        async function loginUser() {
+            const r = await api("/api/login", "POST", { username: $("reg_user").value, password: $("reg_pass").value });
+            log("POST /api/login -> " + r.status);
+            if (r.status === 200) {
+                session = r.data.session;
+                setLoggedIn(true);
+                out("auth_out", { message: "Logged in. No data is readable yet: you need a capability token for each action." });
+            } else {
+                session = null;
+                setLoggedIn(false);
+                out("auth_out", r.data);
+            }
+        }
+
+        async function scopeToken(scope) {
+            const r = await api("/api/capability", "POST", { scope: scope }, session);
+            log("POST /api/capability scope=" + scope + " -> " + r.status);
+            if (r.status !== 200) { out("data_out", r.data); return null; }
+            $("token_info").textContent = "Token for " + scope + " (valid " + r.data.expires_in + " s): " + r.data.token.slice(0, 26) + "...";
+            return r.data.token;
+        }
+
+        async function loadProfile() {
+            const t = await scopeToken("profile:read");
+            if (!t) { return; }
+            const r = await api("/api/profile", "GET", null, t);
+            log("GET /api/profile -> " + r.status);
+            out("data_out", r.data);
+        }
+
+        async function loadNotes() {
+            const t = await scopeToken("notes:read");
+            if (!t) { return; }
+            const r = await api("/api/notes", "GET", null, t);
+            log("GET /api/notes -> " + r.status);
+            out("data_out", r.status === 200 ? { count: r.data.notes.length } : r.data);
+            const list = $("notes_list");
+            list.textContent = "";
+            (r.data.notes || []).forEach((n) => {
+                const li = document.createElement("li");
+                li.textContent = n.text;
+                list.appendChild(li);
+            });
+        }
+
+        async function addNote() {
+            const t = await scopeToken("notes:write");
+            if (!t) { return; }
+            const r = await api("/api/notes", "POST", { text: $("note_text").value }, t);
+            log("POST /api/notes -> " + r.status);
+            out("data_out", r.data);
+            if (r.status === 201) { $("note_text").value = ""; loadNotes(); }
+        }
+
+        async function replayDemo() {
+            const t = await scopeToken("notes:write");
+            if (!t) { return; }
+            const a = await api("/api/notes", "POST", { text: "replay test note" }, t);
+            const b = await api("/api/notes", "POST", { text: "replay test note" }, t);
+            log("Same write token used twice -> " + a.status + " then " + b.status);
+            out("data_out", "First use: HTTP " + a.status + "\nSecond use (replay): HTTP " + b.status + "\n" + JSON.stringify(b.data, null, 2));
+        }
+
+        async function attackSecure() {
+            const p = $("payload").value;
+            const r = await api("/api/login", "POST", { username: p, password: p });
+            log("SECURE login with payload -> " + r.status);
+            out("secure_out", "HTTP " + r.status + "\n" + JSON.stringify(r.data, null, 2) + "\n\nBlocked before any SQL ran.");
+        }
+
+        async function attackVulnerable() {
+            const p = $("payload").value;
+            const res = await fetch("/vulnerable/search?name=" + encodeURIComponent(p));
+            if (res.status === 404) {
+                out("vuln_out", "The vulnerable demo is switched off on this server. This is correct for the cloud version.");
+                log("VULNERABLE search -> 404 (switched off)");
+                return;
+            }
+            const d = await res.json();
+            log("VULNERABLE search with payload -> " + res.status);
+            const rows = d.rows || [];
+            out("vuln_out", "SQL THAT RAN:\n" + d.query + "\n\nROWS RETURNED: " + rows.length + "\n" +
+                JSON.stringify(rows.slice(0, 3), null, 2) + (d.error ? "\n\nDATABASE SAID: " + d.error : ""));
+        }
+
+        $("btn_register").addEventListener("click", registerUser);
+        $("btn_login").addEventListener("click", loginUser);
+        $("btn_profile").addEventListener("click", loadProfile);
+        $("btn_notes").addEventListener("click", loadNotes);
+        $("btn_addnote").addEventListener("click", addNote);
+        $("btn_replay").addEventListener("click", replayDemo);
+        $("btn_secure").addEventListener("click", attackSecure);
+        $("btn_vuln").addEventListener("click", attackVulnerable);
+        document.querySelectorAll("[data-preset]").forEach((b) => {
+            b.addEventListener("click", () => { $("payload").value = PRESETS[Number(b.dataset.preset)]; });
+        });
+        $("payload").value = PRESETS[0];
+    </script>
+</body>
+
+</html>
